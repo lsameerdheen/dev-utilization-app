@@ -7,6 +7,7 @@ DROP TABLE IF EXISTS work_items CASCADE;
 DROP TABLE IF EXISTS projects CASCADE;
 DROP TABLE IF EXISTS azure_config CASCADE;
 DROP TABLE IF EXISTS users CASCADE;
+DROP TABLE IF EXISTS user_client_id_map CASCADE;
 
 -- Users table
 CREATE TABLE users (
@@ -17,6 +18,16 @@ CREATE TABLE users (
     role VARCHAR(50) DEFAULT 'developer',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+--user and client app user id mapping for integration
+CREATE TABLE IF NOT EXISTS user_client_id_map
+(
+    user_id integer,
+    id integer NOT NULL,
+    client_user_id character varying(255),
+    active boolean NOT NULL DEFAULT true,
+    CONSTRAINT user_client_id_map_pkey PRIMARY KEY (id)
+)
 
 -- Projects table
 CREATE TABLE projects (
