@@ -303,9 +303,9 @@ async def get_projects(current_user: str = Depends(get_current_user),current_rol
                     "created_at": "",                  
                 }                 
     result = []
-    if current_role == "admin":        
-        query = projects.select()
-        result = await database.fetch_all(query)
+    #if current_role == "admin":        
+    query = projects.select()
+    result = await database.fetch_all(query)
     return result    
    
 
@@ -519,7 +519,7 @@ async def sync_azure_boards(current_user: str = Depends(get_current_user),client
                     update_query = work_items.update().where(
                         work_items.c.ado_id == str(wi.id)
                     ).values(**work_item_data, updated_at=datetime.utcnow())
-                    #await database.execute(update_query)
+                    await database.execute(update_query)
                 else:
                     print(" work item not exists")
                     # Create new work item (assign to default project)
@@ -540,7 +540,7 @@ async def sync_azure_boards(current_user: str = Depends(get_current_user),client
                     
                     work_item_data["project_id"] = project_id
                     insert_query = work_items.insert().values(**work_item_data)
-                    #await database.execute(insert_query)
+                    await database.execute(insert_query)
                 
                 synced_count += 1
         
