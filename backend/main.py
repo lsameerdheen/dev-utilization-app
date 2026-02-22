@@ -15,7 +15,7 @@ from msrest.authentication import BasicAuthentication
 import asyncio
 
 # Database configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://devutiluser:devutilpass@localhost:5432/devutilization")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgres://avnadmin:AVNS_11h1a2aOgd1bgBpMwyT@pglearn-ameerdeen-b188.i.aivencloud.com:18706/defaultdb?sslmode=require")
 database = databases.Database(DATABASE_URL)
 metadata = MetaData()
 
