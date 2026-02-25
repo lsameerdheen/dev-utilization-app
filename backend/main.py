@@ -291,7 +291,7 @@ async def login(user: UserLogin):
     }
 
 @app.get("/api/projects")
-async def get_projects(current_user: str = Depends(get_current_user),current_role: str = Depends(get_current_role)):
+async def get_projects(current_user: str = Depends(get_current_user),current_role: str = Depends(get_current_role),client_id_user_mapping: str =Depends(get_client_user_id)):
     #No projects 
     no_default_project = {
                     "id": "0",
@@ -302,11 +302,18 @@ async def get_projects(current_user: str = Depends(get_current_user),current_rol
                     "status": "",
                     "created_at": "",                  
                 }                 
-    result = []
+    #result = []
     if current_role == "admin":        
         query = projects.select()
         result = await database.fetch_all(query)
-    return result    
+    else:
+        query_wp = work_items.select().where( or_( work_items.c.assigned_to.ilike(current_user), work_items.c.assigned_to.ilike(client_id_user_mapping)))
+        print("query_wp: " , query_wp)
+        result_wp = await database.fetch_all(query_wp)        
+        query =  projects.select().where(projects.c.id.in_([1,4]))
+        print("query:" ,query)
+        result = await database.fetch_all(query)
+    return result  
    
 
 @app.post("/api/projects")
