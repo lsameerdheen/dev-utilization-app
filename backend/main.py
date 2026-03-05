@@ -6,13 +6,16 @@ from typing import List, Optional
 from datetime import datetime, date
 import databases
 import sqlalchemy
-from sqlalchemy import create_engine, MetaData, Table, Column, Integer, String, Float, DateTime, Date, Text, Boolean, and_ , or_ 
+from sqlalchemy import create_engine, MetaData, Table, Column, Integer, String, Float, DateTime, Date, Text, Boolean, and_ , or_
 import os
 from passlib.context import CryptContext
 import jwt
 from azure.devops.connection import Connection
 from msrest.authentication import BasicAuthentication
 import asyncio
+
+# ADD: Query helper
+from fastapi import Query  # <-- ADD
 
 # Database configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://devutiluser:devutilpass@localhost:5432/devutilization")
@@ -45,7 +48,7 @@ user_client_map = Table(
     Column("id", Integer, primary_key=True),
     Column("user_id", Integer, nullable=False),
     Column("client_user_id", String(255)),
-    Column("active", Boolean),   
+    Column("active", Boolean),
 )
 
 projects = Table(
@@ -168,6 +171,14 @@ class AzureConfigCreate(BaseModel):
     project_name: str
     personal_access_token: str
 
+# Pydantic model to return user info without sensitive data
+class UserOut(BaseModel):
+    id: int
+    email: EmailStr
+    name: Optional[str]
+    role: Optional[str]
+    created_at: Optional[datetime] = None
+
 # FastAPI App
 app = FastAPI(title="Developer Utilization API", version="1.0.0")
 
@@ -223,21 +234,33 @@ async def get_current_role(credentials: HTTPAuthorizationCredentials = Depends(s
         return get_current_role
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
-        
+
+# ADD: Reliable role helper (non-breaking; we will use this in new checks)
+async def get_role(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        role: str = payload.get("role")
+        if role is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return role.lower()
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
 async def get_client_user_id(current_user: str = Depends(get_current_user)):
     #fetching user and client mapping details starts ------
     print("current_user : ",current_user)
     print("Fetching login user details")
     query = users.select().where(users.c.email == current_user)
     db_user = await database.fetch_one(query)
-    print(query) 
+    print(query)
     email = db_user["email"]
     role = db_user["role"]
-    userid  = db_user["id"]    
-    print("Fetching user client mapping  details for " ,userid )
+    userid = db_user["id"]
+    print("Fetching user client mapping details for " ,userid )
     query_user_client = user_client_map.select().where(user_client_map.c.user_id == userid)
     print(query_user_client)
-    db_user_client  = await database.fetch_one(query_user_client)
+    db_user_client = await database.fetch_one(query_user_client)
     if not db_user_client:
         client_id_user_mapping = ""
     else:
@@ -258,7 +281,6 @@ async def register(user: UserCreate):
     existing_user = await database.fetch_one(query)
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
-    
     hashed_password = get_password_hash(user.password)
     query = users.insert().values(
         email=user.email,
@@ -278,8 +300,7 @@ async def login(user: UserLogin):
     print(db_user["password_hash"])
     if not db_user or not verify_password(user.password, db_user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    access_token = create_access_token(data={"sub": db_user["email"], "role": db_user["role"]})
+    access_token = create_access_token(data={"sub": db_user["email"], "role": (db_user["role"] or "").lower()})
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -290,28 +311,71 @@ async def login(user: UserLogin):
         }
     }
 
-@app.get("/api/projects")
-async def get_projects(current_user: str = Depends(get_current_user),current_role: str = Depends(get_current_role)):
-    #No projects 
-    no_default_project = {
-                    "id": "0",
-                    "name": "No Default Project",
-                    "description": "No Default Project",
-                    "start_date": "",
-                    "end_date": "",
-                    "status": "",
-                    "created_at": "",                  
-                }                 
-    result = []
-    #if current_role == "admin":        
-    query = projects.select()
+@app.get("/api/users", response_model=List[UserOut])
+async def list_users(current_role: str = Depends(get_current_role), enforced_role: str = Depends(get_role)):  # <-- ADD param
+    # ADD: admin guard using reliable helper
+    if enforced_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    query = users.select()
     result = await database.fetch_all(query)
-    return result    
-   
+    return result
+
+@app.get("/api/users/{user_id}", response_model=UserOut)
+async def get_user(user_id: int, current_role: str = Depends(get_current_role), enforced_role: str = Depends(get_role)):  # <-- ADD param
+    # ADD: admin guard
+    if enforced_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    query = users.select().where(users.c.id == user_id)
+    user_record = await database.fetch_one(query)
+    if not user_record:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user_record
+
+@app.delete("/api/users/{user_id}")
+async def delete_user(user_id: int, current_role: str = Depends(get_current_role), enforced_role: str = Depends(get_role)):  # <-- ADD param
+    # ADD: admin guard
+    if enforced_role != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    query = users.delete().where(users.c.id == user_id)
+    await database.execute(query)
+    return {"message": f"User with id {user_id} deleted"}
+
+@app.get("/api/projects")
+async def get_projects(
+    current_user: str = Depends(get_current_user),
+    current_role: str = Depends(get_role),            # <-- ADD
+    scope: Optional[str] = Query(None)                # <-- ADD
+):
+    # No projects
+    no_default_project = {
+        "id": "0",
+        "name": "No Default Project",
+        "description": "No Default Project",
+        "start_date": "",
+        "end_date": "",
+        "status": "",
+        "created_at": "",
+    }
+    result = []
+    # Admin + no scope => return all (preserves original behavior)
+    if current_role == "admin" and scope != "mine":
+        query = projects.select()
+        result = await database.fetch_all(query)
+        return result
+
+    # Non-admin or scope='mine' => only projects that have user's assigned work items
+    sql = """
+        SELECT DISTINCT p.*
+        FROM projects p
+        JOIN work_items wi ON wi.project_id = p.id
+        WHERE wi.assigned_to ILIKE :email
+    """
+    result = await database.fetch_all(sql, {"email": current_user})
+    return result
 
 @app.post("/api/projects")
-async def create_project(project: ProjectCreate, current_user: str = Depends(get_current_user)):
-    if current_role == "admin": 
+async def create_project(project: ProjectCreate, current_user: str = Depends(get_current_user), current_role: str = Depends(get_role)):  # <-- ADD role
+    if current_role == "admin":
         query = projects.insert().values(**project.dict())
         project_id = await database.execute(query)
         return {"id": project_id, **project.dict()}
@@ -334,20 +398,41 @@ async def update_project(project_id: int, project: ProjectCreate, current_user: 
 @app.get("/api/work-items")
 async def get_work_items(
     project_id: Optional[int] = None,
+    scope: Optional[str] = Query(None),                 # <-- ADD
     current_user: str = Depends(get_current_user),
-    client_user: str = Depends(get_client_user_id)
-    
-):    
+    client_user: str = Depends(get_client_user_id),
+    current_role: str = Depends(get_role)               # <-- ADD
+):
     if not client_user:
         client_id_user_mapping = ""
     else:
         client_id_user_mapping = client_user
     print(client_id_user_mapping)
-    
+
+    # Admin + no scope => return all items (new behavior for admins, preserves non-admin path)
+    if current_role == "admin" and scope != "mine":
+        if project_id:
+            query = work_items.select().where(work_items.c.project_id == project_id)
+        else:
+            query = work_items.select()
+        result = await database.fetch_all(query)
+        return result
+
+    # Existing user-scoped behavior (unchanged)
     if project_id:
-        query = work_items.select().where(work_items.c.project_id == project_id).where( or_( work_items.c.assigned_to.ilike(current_user), work_items.c.assigned_to.ilike(client_id_user_mapping)))
+        query = work_items.select().where(work_items.c.project_id == project_id).where(
+            or_(
+                work_items.c.assigned_to.ilike(current_user),
+                work_items.c.assigned_to.ilike(client_id_user_mapping)
+            )
+        )
     else:
-        query = work_items.select().where( or_( work_items.c.assigned_to.ilike(current_user), work_items.c.assigned_to.ilike(client_id_user_mapping)))
+        query = work_items.select().where(
+            or_(
+                work_items.c.assigned_to.ilike(current_user),
+                work_items.c.assigned_to.ilike(client_id_user_mapping)
+            )
+        )
     print(query)
     result = await database.fetch_all(query)
     return result
@@ -373,12 +458,23 @@ async def delete_work_item(item_id: int, current_user: str = Depends(get_current
 @app.get("/api/backlogs")
 async def get_backlogs(
     project_id: Optional[int] = None,
-    current_user: str = Depends(get_current_user)
+    scope: Optional[str] = Query(None),                # <-- ADD
+    current_user: str = Depends(get_current_user),
+    current_role: str = Depends(get_role)              # <-- ADD
 ):
+    # Admin + no scope => keep existing "all" behavior
+    if current_role == "admin" and scope != "mine":
+        if project_id:
+            query = backlogs.select().where(backlogs.c.project_id == project_id)
+        else:
+            query = backlogs.select()
+        result = await database.fetch_all(query)
+        return result
+
+    # Scoped: only creator's backlogs
+    query = backlogs.select().where(backlogs.c.created_by.ilike(current_user))
     if project_id:
-        query = backlogs.select().where(backlogs.c.project_id == project_id)
-    else:
-        query = backlogs.select()
+        query = query.where(backlogs.c.project_id == project_id)
     result = await database.fetch_all(query)
     return result
 
@@ -404,20 +500,20 @@ async def delete_backlog(backlog_id: int, current_user: str = Depends(get_curren
 async def create_task_progress(progress: TaskProgressCreate, current_user: str = Depends(get_current_user)):
     query = task_progress.insert().values(**progress.dict(), user_email=current_user)
     progress_id = await database.execute(query)
-    
+
     # Update actual hours in work item
     hours_query = """
-        SELECT SUM(hours_worked) as total_hours 
-        FROM task_progress 
-        WHERE work_item_id = :work_item_id
+    SELECT SUM(hours_worked) as total_hours
+    FROM task_progress
+    WHERE work_item_id = :work_item_id
     """
     total_hours = await database.fetch_val(hours_query, {"work_item_id": progress.work_item_id})
-    
+
     update_query = work_items.update().where(
         work_items.c.id == progress.work_item_id
     ).values(actual_hours=total_hours or 0.0)
     await database.execute(update_query)
-    
+
     return {"id": progress_id, **progress.dict()}
 
 @app.get("/api/task-progress/{work_item_id}")
@@ -430,7 +526,6 @@ async def get_task_progress(work_item_id: int, current_user: str = Depends(get_c
 async def save_azure_config(config: AzureConfigCreate, current_user: str = Depends(get_current_user)):
     # Deactivate existing configs
     await database.execute(azure_config.update().values(is_active=False))
-    
     query = azure_config.insert().values(**config.dict(), is_active=True)
     config_id = await database.execute(query)
     return {"id": config_id, "message": "Azure DevOps configuration saved"}
@@ -453,35 +548,33 @@ async def sync_azure_boards(current_user: str = Depends(get_current_user),client
     # Get active config
     query = azure_config.select().where(azure_config.c.is_active == True)
     config = await database.fetch_one(query)
-    
     if not config:
         raise HTTPException(status_code=400, detail="Azure DevOps not configured")
-    
     try:
         if not client_user:
             client_id_user_mapping = ""
         else:
             client_id_user_mapping = client_user
+
         # Connect to Azure DevOps
         credentials = BasicAuthentication('', config["personal_access_token"])
         connection = Connection(base_url=config["organization_url"], creds=credentials)
-        
+
         # Get work item tracking client
         wit_client = connection.clients.get_work_item_tracking_client()
-        
+
         # Query for work items (customize WIQL as needed)
         wiql_query = """
-            SELECT [System.Id], [System.Title], [System.State], 
-                   [System.AssignedTo], [Microsoft.VSTS.Scheduling.StartDate],
-                   [Microsoft.VSTS.Scheduling.FinishDate], 
-                   [Microsoft.VSTS.Scheduling.OriginalEstimate],
-                   [Microsoft.VSTS.Scheduling.CompletedWork]
-            FROM WorkItems
-            WHERE [System.TeamProject] = 'Spark' 
+        SELECT [System.Id], [System.Title], [System.State],
+        [System.AssignedTo], [Microsoft.VSTS.Scheduling.StartDate],
+        [Microsoft.VSTS.Scheduling.FinishDate],
+        [Microsoft.VSTS.Scheduling.OriginalEstimate],
+        [Microsoft.VSTS.Scheduling.CompletedWork]
+        FROM WorkItems
+        WHERE [System.TeamProject] = 'Spark'
         """
-        wiql_query +=  "  AND [System.AssignedTo] = '" + client_id_user_mapping + "'"
-        wiql_query +=  "  AND ([System.WorkItemType] CONTAINS  'BACKLOG' OR  [System.WorkItemType] CONTAINS   'FEATURE' OR  [System.WorkItemType] CONTAINS  'BUG' OR   [System.WorkItemType] CONTAINS  'TASK' )"
-            
+        wiql_query += " AND [System.AssignedTo] = '" + client_id_user_mapping + "'"
+        wiql_query += " AND ([System.WorkItemType] CONTAINS 'BACKLOG' OR [System.WorkItemType] CONTAINS 'FEATURE' OR [System.WorkItemType] CONTAINS 'BUG' OR [System.WorkItemType] CONTAINS 'TASK' )"
         print(wiql_query)
         #AND [System.State] <> 'Closed'
         #@project
@@ -493,14 +586,12 @@ async def sync_azure_boards(current_user: str = Depends(get_current_user),client
         if query_result.work_items:
             work_item_ids = [item.id for item in query_result.work_items]
             work_items_data = wit_client.get_work_items(ids=work_item_ids, expand='All')
-            
             for wi in work_items_data:
                 fields = wi.fields
-                
                 # Check if work item already exists
                 existing_query = work_items.select().where(work_items.c.ado_id == str(wi.id))
                 existing = await database.fetch_one(existing_query)
-                
+
                 work_item_data = {
                     "title": fields.get("System.Title", ""),
                     "status": fields.get("System.State", "new"),
@@ -512,7 +603,7 @@ async def sync_azure_boards(current_user: str = Depends(get_current_user),client
                     "ado_id": str(wi.id),
                     "type": fields.get("System.WorkItemType", "task"),
                 }
-               
+
                 if existing:
                     print(" work item already exists")
                     # Update existing work item
@@ -526,7 +617,6 @@ async def sync_azure_boards(current_user: str = Depends(get_current_user),client
                     # Get first project or create default
                     project_query = projects.select().where(projects.c.name== "Spark")
                     project = await database.fetch_one(project_query)
-                    
                     if not project:
                         # Create default project
                         default_project = projects.insert().values(
@@ -537,18 +627,16 @@ async def sync_azure_boards(current_user: str = Depends(get_current_user),client
                         #project_id = await database.execute(default_project)
                     else:
                         project_id = project["id"]
-                    
+
                     work_item_data["project_id"] = project_id
                     insert_query = work_items.insert().values(**work_item_data)
                     await database.execute(insert_query)
-                
-                synced_count += 1
-        
+                    synced_count += 1
+
         return {
             "message": "Azure DevOps sync completed",
             "synced_count": synced_count
         }
-        
     except Exception as e:
         print(str(e))
         raise HTTPException(status_code=500, detail=f"Azure DevOps sync failed: {str(e)}")
@@ -559,41 +647,44 @@ async def get_utilization_report(
     end_date: Optional[date] = None,
     current_user: str = Depends(get_current_user),
     client_user: str = Depends(get_client_user_id),
-    current_role: str = Depends(get_current_role)
+    current_role: str = Depends(get_current_role),
+    enforced_role: str = Depends(get_role)  # <-- ADD reliable role
 ):
-    if current_role== "admin":
+    # Use reliable role for branching
+    if enforced_role == "admin":
+        # FIX: add missing closing parenthesis in admin SQL
         query = """
-            SELECT 
-                u.email,
-                u.name,
-                COUNT(DISTINCT wi.id) as total_tasks,
-                SUM(wi.estimated_hours) as total_estimated_hours,
-                SUM(wi.actual_hours) as total_actual_hours,
-                AVG(tp.progress_percentage) as avg_progress
-            FROM users u
-            LEFT JOIN work_items wi ON (wi.assigned_to = u.email 
-            LEFT JOIN task_progress tp ON tp.work_item_id = wi.id AND tp.user_email = u.email
-            WHERE 1=1
+        SELECT 
+          u.email, 
+          u.name, 
+          COUNT(DISTINCT wi.id) as total_tasks, 
+          SUM(wi.estimated_hours) as total_estimated_hours, 
+          SUM(wi.actual_hours) as total_actual_hours, 
+          AVG(tp.progress_percentage) as avg_progress 
+        FROM users u 
+        LEFT JOIN work_items wi ON (wi.assigned_to = u.email)
+        LEFT JOIN task_progress tp ON tp.work_item_id = wi.id AND tp.user_email = u.email 
+        WHERE 1=1
         """
+        params = {}
     else:
         query = """
-            SELECT 
-                u.email,
-                u.name,
-                COUNT(DISTINCT wi.id) as total_tasks,
-                SUM(wi.estimated_hours) as total_estimated_hours,
-                SUM(wi.actual_hours) as total_actual_hours,
-                AVG(tp.progress_percentage) as avg_progress
-            FROM users u
-            LEFT JOIN work_items wi ON (wi.assigned_to ILIKE :email  OR wi.assigned_to ILIKE :clientsideid)
-            LEFT JOIN task_progress tp ON tp.work_item_id = wi.id AND tp.user_email = u.email
-            WHERE 1=1
+        SELECT 
+          u.email, 
+          u.name, 
+          COUNT(DISTINCT wi.id) as total_tasks, 
+          SUM(wi.estimated_hours) as total_estimated_hours, 
+          SUM(wi.actual_hours) as total_actual_hours, 
+          AVG(tp.progress_percentage) as avg_progress 
+        FROM users u 
+        LEFT JOIN work_items wi ON (wi.assigned_to ILIKE :email OR wi.assigned_to ILIKE :clientsideid) 
+        LEFT JOIN task_progress tp ON tp.work_item_id = wi.id AND tp.user_email = u.email 
+        WHERE 1=1
         """
-    
-    params = {}
-    params["email"] = current_user 
-    params["clientsideid"] = client_user #id for assigned in AzureDevops is based on the logged in id
-    
+        params = {
+            "email": current_user,
+            "clientsideid": client_user
+        }
 
     if start_date:
         query += " AND wi.start_date >= :start_date"
@@ -601,29 +692,51 @@ async def get_utilization_report(
     if end_date:
         query += " AND wi.end_date <= :end_date"
         params["end_date"] = end_date
-    
+
     query += " GROUP BY u.email, u.name"
     print(query)
     result = await database.fetch_all(query, params)
     return result
 
 @app.get("/api/reports/project-status")
-async def get_project_status_report(current_user: str = Depends(get_current_user)):
-    query = """
-        SELECT 
-            p.id,
-            p.name,
-            p.status,
-            COUNT(wi.id) as total_work_items,
-            SUM(CASE WHEN wi.status IN ( 'completed','Committed','Done') THEN 1 ELSE 0 END) as completed_items,
-            SUM(wi.estimated_hours) as total_estimated_hours,
-            SUM(wi.actual_hours) as total_actual_hours
-        FROM projects p
-        LEFT JOIN work_items wi ON wi.project_id = p.id
-        GROUP BY p.id, p.name, p.status
-    """
-    
-    result = await database.fetch_all(query)
+async def get_project_status_report(
+    scope: Optional[str] = Query(None),                 # <-- ADD
+    current_user: str = Depends(get_current_user),
+    client_user: str = Depends(get_client_user_id),
+    current_role: str = Depends(get_role)               # <-- ADD
+):
+    params = {}
+    if current_role == "admin" and scope != "mine":
+        query = """
+            SELECT 
+              p.id, 
+              p.name, 
+              p.status, 
+              COUNT(wi.id) as total_work_items, 
+              SUM(CASE WHEN wi.status IN ( 'completed','Committed','Done') THEN 1 ELSE 0 END) as completed_items, 
+              SUM(wi.estimated_hours) as total_estimated_hours, 
+              SUM(wi.actual_hours) as total_actual_hours 
+            FROM projects p 
+            LEFT JOIN work_items wi ON wi.project_id = p.id 
+            GROUP BY p.id, p.name, p.status 
+        """
+    else:
+        query = """
+            SELECT 
+              p.id, 
+              p.name, 
+              p.status, 
+              COUNT(wi.id) as total_work_items, 
+              SUM(CASE WHEN wi.status IN ( 'completed','Committed','Done') THEN 1 ELSE 0 END) as completed_items, 
+              SUM(wi.estimated_hours) as total_estimated_hours, 
+              SUM(wi.actual_hours) as total_actual_hours 
+            FROM projects p 
+            LEFT JOIN work_items wi ON wi.project_id = p.id 
+            WHERE wi.assigned_to ILIKE :email OR wi.assigned_to ILIKE :client
+            GROUP BY p.id, p.name, p.status 
+        """
+        params = {"email": current_user, "client": client_user or ""}
+    result = await database.fetch_all(query, params)
     return result
 
 if __name__ == "__main__":
